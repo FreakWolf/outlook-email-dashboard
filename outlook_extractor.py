@@ -9,6 +9,57 @@ import pywintypes
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 import os
+import tempfile
+
+# Optional: for reading Excel/CSV attachments
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+
+def _read_attachment_text(item, max_chars=6000):
+    """
+    Extract text from Excel/CSV attachments on an email.
+    Saves attachments to a temp file and reads their contents.
+    """
+    texts = []
+    try:
+        for att in item.Attachments:
+            try:
+                fname = str(att.FileName or "").lower()
+                if fname.endswith((".xlsx", ".xls", ".csv")):
+                    tmp_dir = tempfile.gettempdir()
+                    tmp_path = os.path.join(tmp_dir, f"_mailatt_{att.FileName}")
+                    att.SaveAsFile(tmp_path)
+                    text = _extract_spreadsheet_text(tmp_path)
+                    if text:
+                        texts.append(f"[Attachment: {att.FileName}]\n{text}")
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    combined = "\n\n".join(texts)
+    return combined[:max_chars]
+
+
+def _extract_spreadsheet_text(path):
+    """Read an Excel or CSV file into a plain text representation."""
+    try:
+        if path.lower().endswith(".csv"):
+            df = pd.read_csv(path, nrows=100, dtype=str, on_bad_lines="skip")
+        else:
+            df = pd.read_excel(path, nrows=100, dtype=str)
+        df = df.fillna("")
+        return df.to_string(index=False, max_rows=100)
+    except Exception:
+        return ""
 
 
 def _com_datetime_to_iso(dt_val):
@@ -51,7 +102,18 @@ def get_outlook_app():
         )
 
 
-def get_folder_emails(folder, max_emails=300, mailbox_name="", start_date=None, end_date=None):
+def _clean_body(text, max_chars=8000):
+    """Clean and truncate an email body."""
+    if not text:
+        return ""
+    # Collapse excessive whitespace
+    lines = [ln.strip() for ln in str(text).splitlines()]
+    lines = [ln for ln in lines if ln]
+    cleaned = "\n".join(lines)
+    return cleaned[:max_chars]
+
+
+def get_folder_emails(folder, max_emails=300, mailbox_name="", start_date=None, end_date=None, include_body=False):
     """Extract emails from a specific Outlook folder using date restriction for speed."""
     emails = []
 
@@ -113,6 +175,15 @@ def get_folder_emails(folder, max_emails=300, mailbox_name="", start_date=None, 
                     "Mailbox": mailbox_name,
                     "ConversationTopic": str(getattr(item, "ConversationTopic", "") or ""),
                 }
+
+                # Include body and attachment text only when needed (for LLM extraction)
+                if include_body:
+                    email_data["Body"] = _clean_body(getattr(item, "Body", "") or "")
+                    if item.Attachments.Count > 0:
+                        email_data["AttachmentText"] = _read_attachment_text(item)
+                    else:
+                        email_data["AttachmentText"] = ""
+
                 emails.append(email_data)
                 count += 1
         except Exception:
@@ -173,7 +244,7 @@ def _collect_folders(folder, folder_list, depth=0):
         pass
 
 
-def extract_emails(max_per_folder=300, start_date=None, end_date=None, mailboxes=None, folder_scope=None):
+def extract_emails(max_per_folder=300, start_date=None, end_date=None, mailboxes=None, folder_scope=None, include_body=False):
     """
     Main extraction function. Scans all mailbox stores including shared mailboxes.
     
@@ -183,6 +254,7 @@ def extract_emails(max_per_folder=300, start_date=None, end_date=None, mailboxes
         end_date: End date string (YYYY-MM-DD). None = today.
         mailboxes: List of mailbox names to scan. None = all mailboxes.
         folder_scope: List of folder names to scan (e.g. ["Inbox", "Sent Items"]). None = Inbox + Sent.
+        include_body: If True, also extract email body and attachment text (for LLM parsing).
     
     Returns:
         pandas DataFrame with all extracted email data
@@ -232,7 +304,7 @@ def extract_emails(max_per_folder=300, start_date=None, end_date=None, mailboxes
 
         for entry in folder_entries:
             try:
-                emails = get_folder_emails(entry["folder"], max_per_folder, entry["mailbox"], restrict_start, restrict_end)
+                emails = get_folder_emails(entry["folder"], max_per_folder, entry["mailbox"], restrict_start, restrict_end, include_body)
                 all_emails.extend(emails)
             except Exception:
                 continue

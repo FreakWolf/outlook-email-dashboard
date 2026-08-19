@@ -1,46 +1,27 @@
 """
-Outlook Email Dashboard
-A Streamlit dashboard that visualizes email data extracted from Outlook.
+Outlook Email Data Extractor Dashboard
+Extracts structured data (Date, Brand, Cartons, Units, Adhoc, Comments, PO)
+from Outlook emails using a local Ollama LLM.
 """
 
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from outlook_extractor import extract_emails, export_to_csv, get_available_mailboxes
+from llm_extractor import extract_batch, check_ollama_available, TARGET_FIELDS, DEFAULT_MODEL
 
 # Page config
 st.set_page_config(
-    page_title="Outlook Email Dashboard",
+    page_title="Email Data Extractor",
     page_icon="📧",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Custom styling
-st.markdown("""
-<style>
-    .metric-card {
-        background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%);
-        padding: 20px;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-    }
-    .stMetric > div {
-        background-color: #0e1117;
-        padding: 15px;
-        border-radius: 8px;
-        border: 1px solid #262730;
-    }
-</style>
-""", unsafe_allow_html=True)
-
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_data(max_per_folder, start_date, end_date, selected_mailboxes, folder_scope):
-    """Load and cache email data."""
+def load_emails(max_per_folder, start_date, end_date, selected_mailboxes, folder_scope):
+    """Extract raw emails (with body + attachments) from Outlook."""
     mailboxes = selected_mailboxes if selected_mailboxes else None
     folders = list(folder_scope) if folder_scope else None
     df = extract_emails(
@@ -49,28 +30,35 @@ def load_data(max_per_folder, start_date, end_date, selected_mailboxes, folder_s
         end_date=end_date,
         mailboxes=mailboxes,
         folder_scope=folders,
+        include_body=True,
     )
     return df
 
 
-@st.cache_data(ttl=600, show_spinner="Discovering mailboxes...")
+@st.cache_data(ttl=600, show_spinner=False)
 def load_mailboxes():
     """Get available mailbox names."""
     return get_available_mailboxes()
 
 
 def main():
-    # Sidebar controls
-    st.sidebar.title("📧 Mail Dashboard")
+    st.sidebar.title("📧 Email Data Extractor")
     st.sidebar.markdown("---")
 
+    # ---- Ollama status ----
+    ok, msg = check_ollama_available()
+    if ok:
+        st.sidebar.success(f"🤖 Ollama ready ({DEFAULT_MODEL})")
+    else:
+        st.sidebar.error(f"🤖 Ollama: {msg}")
+
+    # ---- Mailboxes ----
     st.sidebar.subheader("Mailboxes")
     try:
         available_mailboxes = load_mailboxes()
     except Exception:
         available_mailboxes = []
 
-    # Select All / Deselect All
     col_sel1, col_sel2 = st.sidebar.columns(2)
     with col_sel1:
         if st.button("Select All", use_container_width=True):
@@ -79,7 +67,6 @@ def main():
         if st.button("Deselect All", use_container_width=True):
             st.session_state["selected_mailboxes"] = []
 
-    # Initialize default selection
     if "selected_mailboxes" not in st.session_state:
         st.session_state["selected_mailboxes"] = available_mailboxes
 
@@ -87,7 +74,6 @@ def main():
         "Select mailboxes to scan",
         available_mailboxes,
         default=st.session_state["selected_mailboxes"],
-        help="Includes your personal mailbox and all shared mailboxes",
         key="mailbox_selector",
     )
 
@@ -103,333 +89,144 @@ def main():
         max_value=today,
         help="Select start and end date for email extraction"
     )
-
-    # Handle single date or range selection
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start_date, end_date = date_range
     else:
         start_date = date_range[0] if isinstance(date_range, tuple) else date_range
         end_date = today
 
-    max_per_folder = st.sidebar.slider("Max emails per folder", 50, 1000, 300, step=50)
+    max_per_folder = st.sidebar.slider("Max emails per folder", 10, 500, 100, step=10)
 
-    # Folder scope
     folder_scope = st.sidebar.multiselect(
         "Folders to scan",
         ["Inbox", "Sent Items", "Deleted Items", "Junk Email", "Archive", "Drafts"],
-        default=["Inbox", "Sent Items"],
-        help="Choose which folders to extract from"
+        default=["Inbox"],
+    )
+
+    # Sender keyword filter (to narrow down which emails to process)
+    sender_filter = st.sidebar.text_input(
+        "Sender contains (optional)",
+        help="Only process emails whose sender/email contains this text. Leave blank for all."
+    )
+    subject_filter = st.sidebar.text_input(
+        "Subject contains (optional)",
+        help="Only process emails whose subject contains this text. Leave blank for all."
     )
 
     st.sidebar.markdown("---")
 
-    # === LOAD BUTTON — extraction only starts here ===
-    load_clicked = st.sidebar.button("🚀 Load Emails", use_container_width=True, type="primary")
-    
-    if st.sidebar.button("🔄 Clear Cache & Reload", use_container_width=True):
+    extract_clicked = st.sidebar.button("🚀 Extract Data", use_container_width=True, type="primary")
+
+    if st.sidebar.button("🔄 Clear Cache", use_container_width=True):
         st.cache_data.clear()
+        for key in ["extracted_data", "raw_emails"]:
+            st.session_state.pop(key, None)
         st.rerun()
 
-    # Main area
-    st.title("📊 Outlook Email Dashboard")
+    # ===== MAIN =====
+    st.title("📊 Email Data Extractor")
+    st.caption("Extracts Date, Brand, Cartons, Units, Adhoc, Comments, PO from your Outlook emails using a local AI model.")
 
-    # Only load data if button is clicked or data is already cached
-    if "email_data" not in st.session_state:
-        st.session_state["email_data"] = None
-        st.session_state["load_params"] = None
-
-    if load_clicked:
-        params = (max_per_folder, str(start_date), str(end_date), tuple(selected_mailboxes), tuple(folder_scope))
-        try:
-            with st.spinner("Extracting emails from Outlook..."):
-                df = load_data(max_per_folder, str(start_date), str(end_date), tuple(selected_mailboxes), tuple(folder_scope))
-            st.session_state["email_data"] = df
-            st.session_state["load_params"] = params
-        except ConnectionError as e:
-            st.error(f"❌ {e}")
-            st.info("Make sure Microsoft Outlook is open and running.")
-            return
-        except Exception as e:
-            st.error(f"❌ Error loading emails: {e}")
-            return
-
-    df = st.session_state.get("email_data")
-
-    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-        st.info("👈 Configure your filters in the sidebar, then click **Load Emails** to start.")
+    if not ok:
+        st.error(f"⚠️ Ollama is not available: {msg}")
+        st.info("Make sure Ollama is installed and running, and the model is pulled (`ollama pull llama3.1`).")
         return
 
-    # Sidebar view filters (these don't trigger re-extraction)
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("View Filters")
+    if extract_clicked:
+        if not selected_mailboxes:
+            st.warning("Please select at least one mailbox.")
+            return
 
-    # Mailbox filter (for viewing)
-    if "Mailbox" in df.columns:
-        mailbox_options = ["All"] + sorted(df["Mailbox"].unique().tolist())
-        selected_mailbox_filter = st.sidebar.selectbox("Mailbox", mailbox_options)
-    else:
-        selected_mailbox_filter = "All"
+        # Step 1: pull raw emails
+        with st.spinner("Reading emails from Outlook..."):
+            try:
+                raw_df = load_emails(
+                    max_per_folder, str(start_date), str(end_date),
+                    tuple(selected_mailboxes), tuple(folder_scope)
+                )
+            except ConnectionError as e:
+                st.error(f"❌ {e}")
+                st.info("Make sure Microsoft Outlook is open and running.")
+                return
+            except Exception as e:
+                st.error(f"❌ Error reading emails: {e}")
+                return
 
-    # Folder filter
-    folders = ["All"] + sorted(df["FolderName"].unique().tolist())
-    selected_folder = st.sidebar.selectbox("Folder", folders)
+        if raw_df.empty:
+            st.warning("No emails found for the selected filters.")
+            return
 
-    # Sender filter
-    top_senders = df["Sender"].value_counts().head(20).index.tolist()
-    selected_senders = st.sidebar.multiselect("Filter by Sender", top_senders)
+        # Apply optional sender/subject filters
+        if sender_filter:
+            mask = raw_df["Sender"].str.contains(sender_filter, case=False, na=False) | \
+                   raw_df["SenderEmail"].str.contains(sender_filter, case=False, na=False)
+            raw_df = raw_df[mask]
+        if subject_filter:
+            raw_df = raw_df[raw_df["Subject"].str.contains(subject_filter, case=False, na=False)]
 
-    # Apply view filters
-    filtered_df = df.copy()
-    if selected_mailbox_filter != "All" and "Mailbox" in df.columns:
-        filtered_df = filtered_df[filtered_df["Mailbox"] == selected_mailbox_filter]
-    if selected_folder != "All":
-        filtered_df = filtered_df[filtered_df["FolderName"] == selected_folder]
-    if selected_senders:
-        filtered_df = filtered_df[filtered_df["Sender"].isin(selected_senders)]
+        if raw_df.empty:
+            st.warning("No emails matched your sender/subject filters.")
+            return
 
-    # Export option
-    st.sidebar.markdown("---")
-    if st.sidebar.button("📥 Export to CSV", use_container_width=True):
-        path = export_to_csv(filtered_df)
-        st.sidebar.success(f"Saved to: {path}")
+        st.info(f"Found {len(raw_df)} emails. Analyzing with AI to extract structured data...")
 
-    # ===== MAIN CONTENT =====
-    st.title("📊 Outlook Email Dashboard")
-    st.caption(f"Showing data from {start_date} to {end_date} • {len(filtered_df):,} emails")
+        # Step 2: run LLM extraction with progress
+        emails_list = raw_df.to_dict("records")
+        progress_bar = st.progress(0.0)
+        status = st.empty()
 
-    # ----- KPI Metrics Row -----
-    col1, col2, col3, col4, col5 = st.columns(5)
+        def on_progress(current, total):
+            progress_bar.progress(current / total)
+            status.text(f"Analyzing email {current} of {total}...")
 
-    with col1:
-        st.metric("Total Emails", f"{len(filtered_df):,}")
-    with col2:
-        unread = filtered_df[~filtered_df["IsRead"]].shape[0]
-        st.metric("Unread", f"{unread:,}")
-    with col3:
-        with_attachments = filtered_df[filtered_df["HasAttachments"]].shape[0]
-        st.metric("With Attachments", f"{with_attachments:,}")
-    with col4:
-        high_importance = filtered_df[filtered_df["Importance"] == 2].shape[0]
-        st.metric("High Importance", f"{high_importance:,}")
-    with col5:
-        unique_senders = filtered_df["Sender"].nunique()
-        st.metric("Unique Senders", f"{unique_senders:,}")
+        results = extract_batch(emails_list, model=DEFAULT_MODEL, progress_callback=on_progress)
+        progress_bar.empty()
+        status.empty()
 
-    st.markdown("---")
+        result_df = pd.DataFrame(results)
+        st.session_state["extracted_data"] = result_df
 
-    # ----- Row 1: Email Volume Over Time + By Folder -----
-    col_left, col_right = st.columns([2, 1])
+    # ===== Display results =====
+    result_df = st.session_state.get("extracted_data")
 
-    with col_left:
-        st.subheader("📈 Email Volume Over Time")
-        daily_counts = filtered_df.groupby("Date").size().reset_index(name="Count")
-        daily_counts["Date"] = pd.to_datetime(daily_counts["Date"])
+    if result_df is None:
+        st.info("👈 Configure your filters in the sidebar, then click **Extract Data** to begin.")
+        return
 
-        fig_volume = px.area(
-            daily_counts,
-            x="Date",
-            y="Count",
-            title="",
-            color_discrete_sequence=["#4fc3f7"],
-        )
-        fig_volume.update_layout(
-            xaxis_title="",
-            yaxis_title="Emails",
-            template="plotly_dark",
-            height=350,
-            margin=dict(l=20, r=20, t=20, b=20),
-        )
-        st.plotly_chart(fig_volume, use_container_width=True)
+    if result_df.empty:
+        st.warning("No data extracted.")
+        return
 
-    with col_right:
-        st.subheader("📁 By Folder")
-        folder_counts = filtered_df["FolderName"].value_counts().reset_index()
-        folder_counts.columns = ["Folder", "Count"]
+    st.success(f"✅ Extracted data from {len(result_df)} emails")
 
-        fig_folder = px.pie(
-            folder_counts,
-            values="Count",
-            names="Folder",
-            color_discrete_sequence=px.colors.qualitative.Set2,
-        )
-        fig_folder.update_layout(
-            template="plotly_dark",
-            height=350,
-            margin=dict(l=20, r=20, t=20, b=20),
-            showlegend=True,
-        )
-        st.plotly_chart(fig_folder, use_container_width=True)
+    # Show the extracted structured data - main focus
+    st.subheader("Extracted Data")
 
-    # ----- Row 2: Top Senders + Day of Week -----
-    col_left2, col_right2 = st.columns(2)
+    # Column order: extracted fields first, then metadata
+    display_order = TARGET_FIELDS + ["Subject", "Sender", "Mailbox", "FolderName", "ReceivedTime"]
+    display_order = [c for c in display_order if c in result_df.columns]
+    display_df = result_df[display_order]
 
-    with col_left2:
-        st.subheader("👤 Top 15 Senders")
-        top_sender_df = (
-            filtered_df["Sender"]
-            .value_counts()
-            .head(15)
-            .reset_index()
-        )
-        top_sender_df.columns = ["Sender", "Count"]
+    st.dataframe(display_df, use_container_width=True, height=500)
 
-        fig_senders = px.bar(
-            top_sender_df,
-            x="Count",
-            y="Sender",
-            orientation="h",
-            color="Count",
-            color_continuous_scale="Blues",
-        )
-        fig_senders.update_layout(
-            template="plotly_dark",
-            height=400,
-            margin=dict(l=20, r=20, t=20, b=20),
-            yaxis=dict(autorange="reversed"),
-            showlegend=False,
-            coloraxis_showscale=False,
-        )
-        st.plotly_chart(fig_senders, use_container_width=True)
-
-    with col_right2:
-        st.subheader("📅 Emails by Day of Week")
-        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        day_counts = filtered_df["DayOfWeek"].value_counts().reindex(day_order, fill_value=0).reset_index()
-        day_counts.columns = ["Day", "Count"]
-
-        fig_days = px.bar(
-            day_counts,
-            x="Day",
-            y="Count",
-            color="Count",
-            color_continuous_scale="Oranges",
-        )
-        fig_days.update_layout(
-            template="plotly_dark",
-            height=400,
-            margin=dict(l=20, r=20, t=20, b=20),
-            showlegend=False,
-            coloraxis_showscale=False,
-            xaxis_title="",
-            yaxis_title="Emails",
-        )
-        st.plotly_chart(fig_days, use_container_width=True)
-
-    # ----- Row 3: Hourly Heatmap + Importance -----
-    col_left3, col_right3 = st.columns([2, 1])
-
-    with col_left3:
-        st.subheader("🕐 Email Activity Heatmap (Hour × Day)")
-        heatmap_data = filtered_df.groupby(["DayOfWeek", "Hour"]).size().reset_index(name="Count")
-        heatmap_pivot = heatmap_data.pivot_table(
-            index="DayOfWeek", columns="Hour", values="Count", fill_value=0
-        )
-        # Reorder days
-        heatmap_pivot = heatmap_pivot.reindex(day_order)
-
-        fig_heatmap = px.imshow(
-            heatmap_pivot,
-            labels=dict(x="Hour of Day", y="Day of Week", color="Emails"),
-            color_continuous_scale="YlOrRd",
-            aspect="auto",
-        )
-        fig_heatmap.update_layout(
-            template="plotly_dark",
-            height=350,
-            margin=dict(l=20, r=20, t=20, b=20),
-        )
-        st.plotly_chart(fig_heatmap, use_container_width=True)
-
-    with col_right3:
-        st.subheader("⚡ By Importance")
-        importance_counts = filtered_df["ImportanceLabel"].value_counts().reset_index()
-        importance_counts.columns = ["Importance", "Count"]
-
-        colors = {"Low": "#4fc3f7", "Normal": "#81c784", "High": "#ef5350"}
-        fig_importance = px.bar(
-            importance_counts,
-            x="Importance",
-            y="Count",
-            color="Importance",
-            color_discrete_map=colors,
-        )
-        fig_importance.update_layout(
-            template="plotly_dark",
-            height=350,
-            margin=dict(l=20, r=20, t=20, b=20),
-            showlegend=False,
-            xaxis_title="",
-            yaxis_title="Count",
-        )
-        st.plotly_chart(fig_importance, use_container_width=True)
-
-    # ----- Row 4: Weekly trend + Read/Unread -----
-    col_left4, col_right4 = st.columns([2, 1])
-
-    with col_left4:
-        st.subheader("📊 Weekly Email Trend")
-        weekly = filtered_df.groupby("Month").size().reset_index(name="Count")
-
-        fig_weekly = px.bar(
-            weekly,
-            x="Month",
-            y="Count",
-            color_discrete_sequence=["#7c4dff"],
-        )
-        fig_weekly.update_layout(
-            template="plotly_dark",
-            height=300,
-            margin=dict(l=20, r=20, t=20, b=20),
-            xaxis_title="",
-            yaxis_title="Emails",
-        )
-        st.plotly_chart(fig_weekly, use_container_width=True)
-
-    with col_right4:
-        st.subheader("📬 Read vs Unread")
-        read_counts = filtered_df["IsRead"].value_counts().reset_index()
-        read_counts.columns = ["Status", "Count"]
-        read_counts["Status"] = read_counts["Status"].map({True: "Read", False: "Unread"})
-
-        fig_read = px.pie(
-            read_counts,
-            values="Count",
-            names="Status",
-            color="Status",
-            color_discrete_map={"Read": "#81c784", "Unread": "#ef5350"},
-            hole=0.4,
-        )
-        fig_read.update_layout(
-            template="plotly_dark",
-            height=300,
-            margin=dict(l=20, r=20, t=20, b=20),
-        )
-        st.plotly_chart(fig_read, use_container_width=True)
-
-    # ----- Row 5: Recent Emails Table -----
-    st.markdown("---")
-    st.subheader("📋 Recent Emails")
-
-    display_cols = ["Subject", "Sender", "ReceivedTime", "Mailbox", "FolderName", "IsRead", "HasAttachments", "ImportanceLabel"]
-    available_cols = [c for c in display_cols if c in filtered_df.columns]
-    display_df = filtered_df[available_cols].head(50).copy()
-    col_names = {"Subject": "Subject", "Sender": "Sender", "ReceivedTime": "Received", "Mailbox": "Mailbox", "FolderName": "Folder", "IsRead": "Read", "HasAttachments": "Attachments", "ImportanceLabel": "Importance"}
-    display_df.columns = [col_names.get(c, c) for c in available_cols]
-
-    # Format the dataframe
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        height=400,
-        column_config={
-            "Subject": st.column_config.TextColumn("Subject", width="large"),
-            "Sender": st.column_config.TextColumn("Sender", width="medium"),
-            "Received": st.column_config.DatetimeColumn("Received", format="MMM DD, YYYY HH:mm"),
-            "Read": st.column_config.CheckboxColumn("Read"),
-            "Attachments": st.column_config.CheckboxColumn("📎"),
-            "Importance": st.column_config.TextColumn("Priority"),
-        },
+    # Export
+    csv = display_df.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(
+        "📥 Download as CSV",
+        data=csv,
+        file_name=f"email_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        use_container_width=False,
     )
+
+    # Summary of fields found
+    st.markdown("---")
+    st.subheader("Extraction Summary")
+    cols = st.columns(len(TARGET_FIELDS))
+    for i, field in enumerate(TARGET_FIELDS):
+        with cols[i]:
+            non_empty = result_df[field].astype(str).str.strip().replace("", pd.NA).notna().sum()
+            st.metric(field, f"{non_empty}/{len(result_df)}")
 
 
 if __name__ == "__main__":
