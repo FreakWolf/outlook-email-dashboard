@@ -51,11 +51,31 @@ def get_outlook_app():
         )
 
 
-def get_folder_emails(folder, max_emails=500, mailbox_name=""):
-    """Extract emails from a specific Outlook folder."""
+def get_folder_emails(folder, max_emails=300, mailbox_name="", start_date=None, end_date=None):
+    """Extract emails from a specific Outlook folder using date restriction for speed."""
     emails = []
-    items = folder.Items
-    items.Sort("[ReceivedTime]", True)  # Sort by newest first
+
+    # Use Outlook's Restrict to filter at COM level (much faster than iterating all)
+    try:
+        restrict_parts = []
+        if start_date:
+            restrict_parts.append(f"[ReceivedTime] >= '{start_date}'")
+        if end_date:
+            # Add one day to end_date to include emails from that entire day
+            end_dt = datetime.strptime(str(end_date), "%Y-%m-%d") + timedelta(days=1)
+            restrict_parts.append(f"[ReceivedTime] < '{end_dt.strftime('%m/%d/%Y')}'")
+
+        if restrict_parts:
+            restrict_str = " AND ".join(restrict_parts)
+            items = folder.Items.Restrict(restrict_str)
+        else:
+            items = folder.Items
+
+        items.Sort("[ReceivedTime]", True)
+    except Exception:
+        # Fallback: no restriction
+        items = folder.Items
+        items.Sort("[ReceivedTime]", True)
 
     count = 0
     for item in items:
@@ -118,10 +138,10 @@ def get_all_stores(namespace):
     return stores
 
 
-def get_inbox_folders(root_folder, mailbox_name, depth=0):
-    """Get key mail folders from a mailbox store root."""
+def get_inbox_folders(root_folder, mailbox_name, folder_scope=None, depth=0):
+    """Get mail folders from a mailbox store root filtered by folder_scope."""
     folders = []
-    target_names = {"Inbox", "Sent Items", "Deleted Items", "Junk Email", "Archive"}
+    target_names = set(folder_scope) if folder_scope else {"Inbox", "Sent Items"}
 
     try:
         for subfolder in root_folder.Folders:
@@ -153,14 +173,16 @@ def _collect_folders(folder, folder_list, depth=0):
         pass
 
 
-def extract_emails(max_per_folder=500, days_back=90, mailboxes=None):
+def extract_emails(max_per_folder=300, start_date=None, end_date=None, mailboxes=None, folder_scope=None):
     """
     Main extraction function. Scans all mailbox stores including shared mailboxes.
     
     Args:
         max_per_folder: Maximum emails to extract per folder
-        days_back: Only extract emails from the last N days
+        start_date: Start date string (YYYY-MM-DD). None = 30 days ago.
+        end_date: End date string (YYYY-MM-DD). None = today.
         mailboxes: List of mailbox names to scan. None = all mailboxes.
+        folder_scope: List of folder names to scan (e.g. ["Inbox", "Sent Items"]). None = Inbox + Sent.
     
     Returns:
         pandas DataFrame with all extracted email data
@@ -168,7 +190,20 @@ def extract_emails(max_per_folder=500, days_back=90, mailboxes=None):
     namespace = get_outlook_app()
     all_emails = []
 
-    cutoff_date = datetime.now() - timedelta(days=days_back)
+    # Parse dates
+    if start_date:
+        start_dt = datetime.strptime(str(start_date), "%Y-%m-%d")
+    else:
+        start_dt = datetime.now() - timedelta(days=30)
+
+    if end_date:
+        end_dt = datetime.strptime(str(end_date), "%Y-%m-%d")
+    else:
+        end_dt = datetime.now()
+
+    # Format for Outlook Restrict filter (MM/DD/YYYY)
+    restrict_start = start_dt.strftime("%m/%d/%Y")
+    restrict_end = (end_dt + timedelta(days=1)).strftime("%m/%d/%Y")
 
     # Get all stores (personal + shared mailboxes)
     stores = get_all_stores(namespace)
@@ -182,20 +217,22 @@ def extract_emails(max_per_folder=500, days_back=90, mailboxes=None):
 
         root = store["root"]
 
-        # Get Inbox and key folders from this store
-        folder_entries = get_inbox_folders(root, store_name)
+        # Get folders from this store based on folder_scope
+        folder_entries = get_inbox_folders(root, store_name, folder_scope)
 
-        # If no standard folders found, try scanning the root's Inbox directly
+        # If no standard folders found, try the root's immediate subfolders
         if not folder_entries:
+            target = set(folder_scope) if folder_scope else {"Inbox", "Sent Items"}
             try:
                 for subfolder in root.Folders:
-                    folder_entries.append({"folder": subfolder, "mailbox": store_name})
+                    if subfolder.Name in target:
+                        folder_entries.append({"folder": subfolder, "mailbox": store_name})
             except Exception:
                 continue
 
         for entry in folder_entries:
             try:
-                emails = get_folder_emails(entry["folder"], max_per_folder, entry["mailbox"])
+                emails = get_folder_emails(entry["folder"], max_per_folder, entry["mailbox"], restrict_start, restrict_end)
                 all_emails.extend(emails)
             except Exception:
                 continue
@@ -215,9 +252,10 @@ def extract_emails(max_per_folder=500, days_back=90, mailboxes=None):
     if df.empty:
         return pd.DataFrame()
 
-    # Filter by date
-    cutoff_aware = pd.Timestamp(cutoff_date, tz="UTC")
-    df = df[df["ReceivedTime"] >= cutoff_aware]
+    # Filter by date range (belt and suspenders — Restrict should have handled this)
+    start_aware = pd.Timestamp(start_dt, tz="UTC")
+    end_aware = pd.Timestamp(end_dt + timedelta(days=1), tz="UTC")
+    df = df[(df["ReceivedTime"] >= start_aware) & (df["ReceivedTime"] < end_aware)]
 
     if df.empty:
         return pd.DataFrame()
@@ -277,7 +315,7 @@ def export_to_csv(df, filename="outlook_emails.csv"):
 
 if __name__ == "__main__":
     print("Extracting emails from Outlook...")
-    df = extract_emails(max_per_folder=200, days_back=30)
+    df = extract_emails(max_per_folder=200, start_date="2026-07-20", end_date="2026-08-19")
     print(f"Extracted {len(df)} emails")
     if not df.empty:
         path = export_to_csv(df)

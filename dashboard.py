@@ -38,11 +38,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=300, show_spinner="Extracting emails from Outlook...")
-def load_data(max_per_folder, days_back, selected_mailboxes):
+@st.cache_data(ttl=300, show_spinner=False)
+def load_data(max_per_folder, start_date, end_date, selected_mailboxes, folder_scope):
     """Load and cache email data."""
     mailboxes = selected_mailboxes if selected_mailboxes else None
-    df = extract_emails(max_per_folder=max_per_folder, days_back=days_back, mailboxes=mailboxes)
+    folders = list(folder_scope) if folder_scope else None
+    df = extract_emails(
+        max_per_folder=max_per_folder,
+        start_date=start_date,
+        end_date=end_date,
+        mailboxes=mailboxes,
+        folder_scope=folders,
+    )
     return df
 
 
@@ -63,39 +70,98 @@ def main():
     except Exception:
         available_mailboxes = []
 
+    # Select All / Deselect All
+    col_sel1, col_sel2 = st.sidebar.columns(2)
+    with col_sel1:
+        if st.button("Select All", use_container_width=True):
+            st.session_state["selected_mailboxes"] = available_mailboxes
+    with col_sel2:
+        if st.button("Deselect All", use_container_width=True):
+            st.session_state["selected_mailboxes"] = []
+
+    # Initialize default selection
+    if "selected_mailboxes" not in st.session_state:
+        st.session_state["selected_mailboxes"] = available_mailboxes
+
     selected_mailboxes = st.sidebar.multiselect(
         "Select mailboxes to scan",
         available_mailboxes,
-        default=available_mailboxes,
-        help="Includes your personal mailbox and all shared mailboxes"
+        default=st.session_state["selected_mailboxes"],
+        help="Includes your personal mailbox and all shared mailboxes",
+        key="mailbox_selector",
     )
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Settings")
-    days_back = st.sidebar.slider("Days to look back", 7, 365, 90, step=7)
-    max_per_folder = st.sidebar.slider("Max emails per folder", 100, 2000, 500, step=100)
 
-    if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
-        st.cache_data.clear()
+    # Date range picker
+    today = datetime.now().date()
+    default_start = today - timedelta(days=30)
+    date_range = st.sidebar.date_input(
+        "Date range",
+        value=(default_start, today),
+        max_value=today,
+        help="Select start and end date for email extraction"
+    )
 
-    # Load data
-    try:
-        df = load_data(max_per_folder, days_back, tuple(selected_mailboxes))
-    except ConnectionError as e:
-        st.error(f"❌ {e}")
-        st.info("Make sure Microsoft Outlook is open and running.")
-        return
-    except Exception as e:
-        st.error(f"❌ Error loading emails: {e}")
-        return
+    # Handle single date or range selection
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        start_date = date_range[0] if isinstance(date_range, tuple) else date_range
+        end_date = today
 
-    if df.empty:
-        st.warning("No emails found for the selected time period.")
-        return
+    max_per_folder = st.sidebar.slider("Max emails per folder", 50, 1000, 300, step=50)
 
-    # Sidebar filters
+    # Folder scope
+    folder_scope = st.sidebar.multiselect(
+        "Folders to scan",
+        ["Inbox", "Sent Items", "Deleted Items", "Junk Email", "Archive", "Drafts"],
+        default=["Inbox", "Sent Items"],
+        help="Choose which folders to extract from"
+    )
+
     st.sidebar.markdown("---")
-    st.sidebar.subheader("Filters")
+
+    # === LOAD BUTTON — extraction only starts here ===
+    load_clicked = st.sidebar.button("🚀 Load Emails", use_container_width=True, type="primary")
+    
+    if st.sidebar.button("🔄 Clear Cache & Reload", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    # Main area
+    st.title("📊 Outlook Email Dashboard")
+
+    # Only load data if button is clicked or data is already cached
+    if "email_data" not in st.session_state:
+        st.session_state["email_data"] = None
+        st.session_state["load_params"] = None
+
+    if load_clicked:
+        params = (max_per_folder, str(start_date), str(end_date), tuple(selected_mailboxes), tuple(folder_scope))
+        try:
+            with st.spinner("Extracting emails from Outlook..."):
+                df = load_data(max_per_folder, str(start_date), str(end_date), tuple(selected_mailboxes), tuple(folder_scope))
+            st.session_state["email_data"] = df
+            st.session_state["load_params"] = params
+        except ConnectionError as e:
+            st.error(f"❌ {e}")
+            st.info("Make sure Microsoft Outlook is open and running.")
+            return
+        except Exception as e:
+            st.error(f"❌ Error loading emails: {e}")
+            return
+
+    df = st.session_state.get("email_data")
+
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        st.info("👈 Configure your filters in the sidebar, then click **Load Emails** to start.")
+        return
+
+    # Sidebar view filters (these don't trigger re-extraction)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("View Filters")
 
     # Mailbox filter (for viewing)
     if "Mailbox" in df.columns:
@@ -112,7 +178,7 @@ def main():
     top_senders = df["Sender"].value_counts().head(20).index.tolist()
     selected_senders = st.sidebar.multiselect("Filter by Sender", top_senders)
 
-    # Apply filters
+    # Apply view filters
     filtered_df = df.copy()
     if selected_mailbox_filter != "All" and "Mailbox" in df.columns:
         filtered_df = filtered_df[filtered_df["Mailbox"] == selected_mailbox_filter]
@@ -129,7 +195,7 @@ def main():
 
     # ===== MAIN CONTENT =====
     st.title("📊 Outlook Email Dashboard")
-    st.caption(f"Showing data from the last {days_back} days • {len(filtered_df):,} emails")
+    st.caption(f"Showing data from {start_date} to {end_date} • {len(filtered_df):,} emails")
 
     # ----- KPI Metrics Row -----
     col1, col2, col3, col4, col5 = st.columns(5)
