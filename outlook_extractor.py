@@ -51,7 +51,7 @@ def get_outlook_app():
         )
 
 
-def get_folder_emails(folder, max_emails=500):
+def get_folder_emails(folder, max_emails=500, mailbox_name=""):
     """Extract emails from a specific Outlook folder."""
     emails = []
     items = folder.Items
@@ -90,6 +90,7 @@ def get_folder_emails(folder, max_emails=500):
                     "Importance": getattr(item, "Importance", 1),
                     "Categories": str(getattr(item, "Categories", "") or ""),
                     "FolderName": folder.Name,
+                    "Mailbox": mailbox_name,
                     "ConversationTopic": str(getattr(item, "ConversationTopic", "") or ""),
                 }
                 emails.append(email_data)
@@ -101,28 +102,41 @@ def get_folder_emails(folder, max_emails=500):
     return emails
 
 
-def get_all_folders(namespace, account_name=None):
-    """Get all mail folders from Outlook."""
-    folders = []
-
-    if account_name:
-        # Try to find specific account
+def get_all_stores(namespace):
+    """Get all mailbox stores (personal + shared) from Outlook."""
+    stores = []
+    try:
         for store in namespace.Stores:
-            if account_name.lower() in store.DisplayName.lower():
+            try:
+                store_name = store.DisplayName
                 root = store.GetRootFolder()
-                _collect_folders(root, folders)
-                return folders
+                stores.append({"name": store_name, "root": root})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return stores
 
-    # Default: use default folders
-    default_folder_ids = [6, 5, 3, 4, 23]  # Inbox, Sent, Deleted, Outbox, Junk
-    folder_names = ["Inbox", "Sent Items", "Deleted Items", "Outbox", "Junk Email"]
 
-    for fid, fname in zip(default_folder_ids, folder_names):
-        try:
-            folder = namespace.GetDefaultFolder(fid)
-            folders.append(folder)
-        except Exception:
-            continue
+def get_inbox_folders(root_folder, mailbox_name, depth=0):
+    """Get key mail folders from a mailbox store root."""
+    folders = []
+    target_names = {"Inbox", "Sent Items", "Deleted Items", "Junk Email", "Archive"}
+
+    try:
+        for subfolder in root_folder.Folders:
+            try:
+                if subfolder.Name in target_names:
+                    folders.append({"folder": subfolder, "mailbox": mailbox_name})
+                # Also check one level deeper for shared mailboxes with different structures
+                if depth < 1:
+                    for sub in subfolder.Folders:
+                        if sub.Name in target_names:
+                            folders.append({"folder": sub, "mailbox": mailbox_name})
+            except Exception:
+                continue
+    except Exception:
+        pass
 
     return folders
 
@@ -139,14 +153,14 @@ def _collect_folders(folder, folder_list, depth=0):
         pass
 
 
-def extract_emails(max_per_folder=500, days_back=90, folders_to_scan=None):
+def extract_emails(max_per_folder=500, days_back=90, mailboxes=None):
     """
-    Main extraction function.
+    Main extraction function. Scans all mailbox stores including shared mailboxes.
     
     Args:
         max_per_folder: Maximum emails to extract per folder
         days_back: Only extract emails from the last N days
-        folders_to_scan: List of folder names to scan. None = default folders.
+        mailboxes: List of mailbox names to scan. None = all mailboxes.
     
     Returns:
         pandas DataFrame with all extracted email data
@@ -156,17 +170,32 @@ def extract_emails(max_per_folder=500, days_back=90, folders_to_scan=None):
 
     cutoff_date = datetime.now() - timedelta(days=days_back)
 
-    if folders_to_scan:
-        # Scan specific folders by name
-        for store in namespace.Stores:
-            root = store.GetRootFolder()
-            _scan_folder_by_name(root, folders_to_scan, all_emails, max_per_folder, cutoff_date)
-    else:
-        # Scan default folders
-        folders = get_all_folders(namespace)
-        for folder in folders:
+    # Get all stores (personal + shared mailboxes)
+    stores = get_all_stores(namespace)
+
+    for store in stores:
+        store_name = store["name"]
+
+        # Filter by selected mailboxes if specified
+        if mailboxes and store_name not in mailboxes:
+            continue
+
+        root = store["root"]
+
+        # Get Inbox and key folders from this store
+        folder_entries = get_inbox_folders(root, store_name)
+
+        # If no standard folders found, try scanning the root's Inbox directly
+        if not folder_entries:
             try:
-                emails = get_folder_emails(folder, max_per_folder)
+                for subfolder in root.Folders:
+                    folder_entries.append({"folder": subfolder, "mailbox": store_name})
+            except Exception:
+                continue
+
+        for entry in folder_entries:
+            try:
+                emails = get_folder_emails(entry["folder"], max_per_folder, entry["mailbox"])
                 all_emails.extend(emails)
             except Exception:
                 continue
@@ -222,6 +251,21 @@ def _scan_folder_by_name(folder, target_names, all_emails, max_per_folder, cutof
             _scan_folder_by_name(subfolder, target_names, all_emails, max_per_folder, cutoff_date, depth + 1)
     except Exception:
         pass
+
+
+def get_available_mailboxes():
+    """Return a list of all mailbox store names available in Outlook."""
+    namespace = get_outlook_app()
+    mailboxes = []
+    try:
+        for store in namespace.Stores:
+            try:
+                mailboxes.append(store.DisplayName)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return mailboxes
 
 
 def export_to_csv(df, filename="outlook_emails.csv"):

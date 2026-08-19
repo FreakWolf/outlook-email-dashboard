@@ -8,7 +8,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from outlook_extractor import extract_emails, export_to_csv
+from outlook_extractor import extract_emails, export_to_csv, get_available_mailboxes
 
 # Page config
 st.set_page_config(
@@ -39,10 +39,17 @@ st.markdown("""
 
 
 @st.cache_data(ttl=300, show_spinner="Extracting emails from Outlook...")
-def load_data(max_per_folder, days_back):
+def load_data(max_per_folder, days_back, selected_mailboxes):
     """Load and cache email data."""
-    df = extract_emails(max_per_folder=max_per_folder, days_back=days_back)
+    mailboxes = selected_mailboxes if selected_mailboxes else None
+    df = extract_emails(max_per_folder=max_per_folder, days_back=days_back, mailboxes=mailboxes)
     return df
+
+
+@st.cache_data(ttl=600, show_spinner="Discovering mailboxes...")
+def load_mailboxes():
+    """Get available mailbox names."""
+    return get_available_mailboxes()
 
 
 def main():
@@ -50,6 +57,20 @@ def main():
     st.sidebar.title("📧 Mail Dashboard")
     st.sidebar.markdown("---")
 
+    st.sidebar.subheader("Mailboxes")
+    try:
+        available_mailboxes = load_mailboxes()
+    except Exception:
+        available_mailboxes = []
+
+    selected_mailboxes = st.sidebar.multiselect(
+        "Select mailboxes to scan",
+        available_mailboxes,
+        default=available_mailboxes,
+        help="Includes your personal mailbox and all shared mailboxes"
+    )
+
+    st.sidebar.markdown("---")
     st.sidebar.subheader("Settings")
     days_back = st.sidebar.slider("Days to look back", 7, 365, 90, step=7)
     max_per_folder = st.sidebar.slider("Max emails per folder", 100, 2000, 500, step=100)
@@ -59,7 +80,7 @@ def main():
 
     # Load data
     try:
-        df = load_data(max_per_folder, days_back)
+        df = load_data(max_per_folder, days_back, tuple(selected_mailboxes))
     except ConnectionError as e:
         st.error(f"❌ {e}")
         st.info("Make sure Microsoft Outlook is open and running.")
@@ -76,6 +97,13 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("Filters")
 
+    # Mailbox filter (for viewing)
+    if "Mailbox" in df.columns:
+        mailbox_options = ["All"] + sorted(df["Mailbox"].unique().tolist())
+        selected_mailbox_filter = st.sidebar.selectbox("Mailbox", mailbox_options)
+    else:
+        selected_mailbox_filter = "All"
+
     # Folder filter
     folders = ["All"] + sorted(df["FolderName"].unique().tolist())
     selected_folder = st.sidebar.selectbox("Folder", folders)
@@ -86,6 +114,8 @@ def main():
 
     # Apply filters
     filtered_df = df.copy()
+    if selected_mailbox_filter != "All" and "Mailbox" in df.columns:
+        filtered_df = filtered_df[filtered_df["Mailbox"] == selected_mailbox_filter]
     if selected_folder != "All":
         filtered_df = filtered_df[filtered_df["FolderName"] == selected_folder]
     if selected_senders:
@@ -314,9 +344,11 @@ def main():
     st.markdown("---")
     st.subheader("📋 Recent Emails")
 
-    display_cols = ["Subject", "Sender", "ReceivedTime", "FolderName", "IsRead", "HasAttachments", "ImportanceLabel"]
-    display_df = filtered_df[display_cols].head(50).copy()
-    display_df.columns = ["Subject", "Sender", "Received", "Folder", "Read", "Attachments", "Importance"]
+    display_cols = ["Subject", "Sender", "ReceivedTime", "Mailbox", "FolderName", "IsRead", "HasAttachments", "ImportanceLabel"]
+    available_cols = [c for c in display_cols if c in filtered_df.columns]
+    display_df = filtered_df[available_cols].head(50).copy()
+    col_names = {"Subject": "Subject", "Sender": "Sender", "ReceivedTime": "Received", "Mailbox": "Mailbox", "FolderName": "Folder", "IsRead": "Read", "HasAttachments": "Attachments", "ImportanceLabel": "Importance"}
+    display_df.columns = [col_names.get(c, c) for c in available_cols]
 
     # Format the dataframe
     st.dataframe(
